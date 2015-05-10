@@ -40,12 +40,18 @@ mem  ;display memory
 |#
 
 (in-package :cl-j1)
+;;; Assembler context
+(defparameter *symtab* nil) ;a hashtable of labels 
+(defparameter *outptr* 0) ;will assemble to here
+(defparameter *instructions* nil) ;list of instructions as assembled
 
-(defparameter mem nil)
-(defparameter symtab nil) ;a hashtable of labels 
-(defparameter outptr 0) ;will assemble to here
-
-
+(defun asm-reset ()
+    (setf
+     *outptr* 0 
+     *instructions* nil
+     *symtab* (make-hash-table)
+     )
+  )
 (defparameter *op-alu* 
   '((:t     . #b0000000000000000 )
     (:n     . #b0000000100000000 )
@@ -83,16 +89,14 @@ mem  ;display memory
 ;; The operand may be a literal/address or a symbol in symtab...
 (defun resolve-symbol (it)
   (if (symbolp it)
-      (prog1
-	  (multiple-value-bind (target exists) (gethash it symtab)
-	    (if exists
-		target
-		(progn
-		  (format t "Unable to resolve symbol ~S" it)))))
+      (multiple-value-bind (target exists) (gethash it *symtab*)
+	(if exists 
+	    target
+	    (format t "Unable to resolve symbol ~S" it)))
       
       it)
   )
-;; figure out the bits
+;; assembler
 (defmacro assoc-int (item alist)
   `(or (cdr (assoc ,item ,alist)) 0))
 (defmacro op-special (prefix operand)
@@ -148,12 +152,13 @@ mem  ;display memory
 	     (:print-function 
 	      (lambda (struct stream depth)
 		(declare (ignore depth))
-		(format stream "~&(asm-line '(~S ~S ~S)"
+		(format stream "~&(asm-line '(~S: ~S ~S ~S)"
+			(aline-addr struct)
 			(aline-label struct )
 			;(aline-op struct)
 			(decode (aline-op struct))
 			(aline-comment struct))))
-	     ) label op comment)
+	     ) addr label op comment)
 
 ;;; An assembly line (aline) contains 3 parts: a :label, a "comment"  and (a numeric opcode)
 ;; Assemble a line
@@ -168,34 +173,26 @@ mem  ;display memory
 	(integer (setf op fragment))          ; integer? just set the opcode
 	(t (format t "fragment ~S is of type ~S which is not expected."
 		   fragment (type-of fragment)))))
-        (make-aline :label label :op op :comment comment)))
+        (make-aline :addr *outptr* :label label :op op :comment comment)))
 
+;;------------------------------------------------------------------------------
+;; asm-line  Assemble a line and attach to *instructions*
+;;
 (defun asm-line (line)
   (let ((al (asm-line-prim line)))    ; assemble a line
     (if (not (null (aline-label al))) ; if there is a label
-	(setf (gethash (aline-label al) symtab) outptr)) ; put it into the symbol table
-    (setf (elt mem outptr) (aline-op al))   )
-)
-
-
-
-
-
-(defun asm-reset ()
-    (setf
-     outptr 0 
-     mem (make-array 64 :element-type '(unsigned-byte 16))
-     symtab (make-hash-table)
-     )
-  )
-
+	(setf (gethash (aline-label al) *symtab*) *outptr*)) ; put it into the symbol table
+   ; (setf (elt mem outptr) (aline-op al)
+    (setf *instructions* (cons al *instructions*))))
+;;------------------------------------------------------------------------------
+;; asm  - assemble a list of assembly code
+;;
 (defun asm (bunch)
   (dolist (line bunch)
     (asm-line line)         ; assemble a line
-    (incf outptr)
-    )
+    (incf *outptr*))
+  (setf *instructions* (reverse *instructions*)))
 
-  )
 
 
 (defun test ()
@@ -210,16 +207,52 @@ mem  ;display memory
      (  (:jmp :restart))
     
     )))
-
+;;;#############################################################################
+;;;
 ;;; simulator
+;;;
+
+(deftype u5 ()  '(unsigned-byte 5))
+(deftype u13 () '(unsigned-byte 13))
+(deftype u16 () '(unsigned-byte 16))
+(defstruct cpu
+#|	     (:print-function 
+	      (lambda (cpu stream depth)
+		(declare (ignore depth))
+		(format stream "~&~4A       ~4A ~4A ~4A ~4A" "PC" "TOS" "NOS" "DSP" "RSP" )
+		(format stream "~%~4,'0X ~4,'0X  ~4,'0X ~4,'0X ~4,'0X ~4,'0X " (pc) (elt mem (pc)) (tos) (at-dstack) (dsp) (rsp) ) 
+		(format t " ~S" (decode (elt mem (pc)))))))
+|#
+  (tos 0 :type u16)
+  (dstack (make-array 32 :element-type '(u16)))
+  (rstack (make-array 32 :element-type '(u16)))
+  (dsp 0 :type u5)
+  (rsp 0 :type u5)
+  (pc  0 :type u13)
+  (mem (make-array 128 :element-type '(u16))))
+
+(defparameter *cpu* (make-cpu))
+
+(defun j1-reset (&optional (addr 0) (cpu *cpu*))
+  (setf (pc) addr
+	(dsp) 0
+	(rsp) 0
+	(tos) 0
+	(dstack) (make-array 32 :element-type '(unsigned-byte 16))
+	(rstack) (make-array 32 :element-type '(unsigned-byte 16))) 
+  cpu
+)
+
+(defun j1-load (asmlines &optional (cpu *cpu*) )
+  (dolist (line asmlines)
+    (setf (elt (cpu-mem cpu) (aline-addr line)) 
+	  (aline-op line)))
+
+)
 
 
-(defparameter dstack (make-array 32 :element-type '(unsigned-byte 16)))
-(defparameter rstack (make-array 32 :element-type '(unsigned-byte 16)))
-(defparameter tos 0)
-(defparameter pc 0)
-(defparameter dsp 0)
-(defparameter rsp 0)
+
+
 
 (defmacro wrap-word (val)
   `(logand #xFFFF ,val))
@@ -227,71 +260,85 @@ mem  ;display memory
 (defmacro opcode-extract-address (opcode)
   `(logand #x1FFF ,opcode))
 
-(defun step1 ()
+(defmacro tos () `(cpu-tos cpu))
+(defmacro pc () `(cpu-pc cpu))
+(defmacro dsp () `(cpu-dsp cpu))
+(defmacro rsp () `(cpu-rsp cpu))
+(defmacro dstack () `(cpu-dstack cpu))
+(defmacro rstack () `(cpu-rstack cpu))
+(defmacro at-dstack () `(elt (dstack) (dsp)))
+(defmacro at-rstack () `(elt (rstack) (rsp)))
+
+(defun step1 (cpu)
   ;(format t "~%ok, pc is ~A" pc)
 
-  (let ((opcode (elt mem pc))
-	(nos-ro (elt dstack dsp))
-	(tor-ro (elt rstack rsp)))
+  (let ((opcode (elt (cpu-mem cpu) (pc))) ;; bind copies of tos,nos and tor as they
+	 (tos-ro (tos))        ;; exist at the beginning of this cycle!
+	 (dsp-ro (dsp))
+	 (rsp-ro (rsp))
+	 (nos-ro (elt (dstack) (dsp))) ;;
+	 (tor-ro (elt (rstack) (rsp)))
+)
     (if (logbitp 15 opcode) ;literal
 	(progn
-	  (setf (elt dstack dsp) tos)          ;; implied t->n
-	  (incf dsp)                           ;; implied DSP++
-	  (setf tos (logand #x7FFF opcode))    ;; load literal into t
-	  (incf pc))
+	  (setf (at-dstack) tos-ro)	    ;; implied t->n
+	  (incf (dsp))			    ;; implied DSP++
+	  (setf (tos) (logand #x7FFF opcode)) ;; load literal into t
+	  (incf (pc)))
 	(case (logand #x6000 opcode)  
 	  ((#x0000) ; jump
-	   (setf pc (opcode-extract-address opcode)))
+	   (setf (pc) (opcode-extract-address opcode)))
 	  ((#x2000) ; cjmp
-	   (if (zerop tos)
-	       (incf pc)
-	       (setf pc (opcode-extract-address opcode)))
-	   (setf tos nos-ro) (decf dsp)) ;implied drop
+	   (if (zerop tos-ro)
+	       (incf (pc))
+	       (setf (pc) (opcode-extract-address opcode)))
+	   (setf (tos) nos-ro) (decf (dsp))) ;implied drop
 	  ((#x4000) ; call
-	   (incf pc)
-	   (incf rsp)
-	   (setf (elt rstack rsp) pc)
-	   (setf pc (opcode-extract-address opcode)))
+	   (incf (pc))
+	   (incf (rsp))
+	   (setf (at-rstack) (pc))
+	   (setf (pc) (opcode-extract-address opcode)))
 	  (otherwise
 	   (if (logbitp 12 opcode); return
-	       (setf pc tor-ro))	 
+	       (setf (pc) tor-ro))	 
 	   ;;(format t "~%PC was ~A" pc)
-	   (incf pc)
+	   (incf (pc))
 	   ;;(format t "~%PC is now ~A" pc)
 	   (let ((alu-op (logand #x0F00 opcode)))
-	     (setf tos 
+	     (setf (tos) 
 		   (case alu-op 
-		     ((#x0000) tos)
+		     ((#x0000) tos-ro)
 		     ((#x0100) nos-ro)
-		     ((#x0200) (wrap-word (+      tos nos-ro)))
-		     ((#x0300) (logand tos nos-ro))
-		     ((#x0400) (logior tos nos-ro))
-		     ((#x0500) (logxor tos nos-ro))
-		     ((#x0600) (lognot tos))
-		     ((#x0700) (if (= tos nos-ro) 1 0))
-		     ((#x0800) (if (< nos-ro tos) 1 0))
-		     ((#x0900) (ash nos-ro tos))
-		     ((#x0A00) (wrap-word (1- tos)))
+		     ((#x0200) (wrap-word (+ tos-ro nos-ro)))
+		     ((#x0300) (logand tos-ro nos-ro))
+		     ((#x0400) (logior tos-ro nos-ro))
+		     ((#x0500) (logxor tos-ro nos-ro))
+		     ((#x0600) (wrap-word (lognot tos-ro)))
+		     ((#x0700) (if (= tos-ro nos-ro) 1 0))
+		     ((#x0800) (if (< nos-ro tos-ro) 1 0))
+		     ((#x0900) (ash nos-ro tos-ro))
+		     ((#x0A00) (wrap-word (1- tos-ro)))
 		     ((#x0B00) tor-ro)
-		     ((#x0C00) (elt mem tos))
-		     ((#x0D00) (ash nos-ro (wrap-word (- 0 tos))))
-		     ((#x0E00) dsp)
-		     ((#x0F00) (if (< nos-ro tos) 1 0)) ;;todo: this should be unsigned...
+		     ((#x0C00) (elt (cpu-mem cpu) tos-ro))
+		     ((#x0D00) (ash nos-ro (wrap-word (- 0 tos-ro))))
+		     ((#x0E00) (dsp))
+		     ((#x0F00) (if (< nos-ro tos-ro) 1 0)) ;;todo: this should be unsigned...
+		     (otherwise 0) ;; cannot happen but necessary for type-checking
 		     ))
 	     (if (logbitp 7 opcode); (not (zerop (logand #x0080 opcode)))
-		 (setf (elt dstack dsp) tos)) ;; T->N
+		 (setf (at-dstack) tos-ro)) ;; T->N
 	     (if (logbitp 6 opcode); (not (zerop (logand #x0040 opcode)))
-		 (setf (elt rstack dsp) tos)) ;; T->R
+		 (setf (at-rstack) tos-ro)) ;; T->R
 	     (if (logbitp 5 opcode); (not (zerop (logand #x0020 opcode)))
-		 (setf (elt mem tos) nos-ro))
+		 (setf (elt (cpu-mem cpu) tos-ro) nos-ro))
 	     (case (logand #x000C opcode)
-	       ((#x0004) (incf rsp))
-	       ((#x000C) (setf rsp (- rsp 2)))
-	       ((#x0008) (decf rsp)))
+	       ((#x0004) (incf (rsp)))
+	       ((#x000C) (setf (rsp) (- rsp-ro 2)))
+	       ((#x0008) (decf (rsp))))
 	     (case (logand #x0003 opcode)
-	       ((#x0001) (incf dsp))
-	       ((#x0002) (setf dsp (- dsp 2)))
-	       ((#x0003) (decf dsp)))  
+	       ((#x0001) (incf (dsp)))
+	       ((#x0002) (setf (dsp) (- dsp-ro 2)))
+	       ((#x0003) (decf (dsp))))  
 
 	     ;; after 
 
@@ -300,17 +347,20 @@ mem  ;display memory
     nil
     ))
 
-(defun ? () 
+(defun ? (&optional (cpu *cpu*)) 
   (format t "~%~4A       ~4A ~4A ~4A ~4A" "PC" "TOS" "NOS" "DSP" "RSP" )
-  (format t "~%~4,'0X ~4,'0X  ~4,'0X ~4,'0X ~4,'0X ~4,'0X " pc (elt mem pc) tos (elt dstack dsp) dsp rsp ) 
-  (format t " ~S" (decode (elt mem pc))))
+  (format t "~%~4,'0X ~4,'0X  ~4,'0X ~4,'0X ~4,'0X ~4,'0X " 
+	  (cpu-pc cpu)
+	  (elt (cpu-mem cpu) (cpu-pc cpu))
+	  (cpu-tos cpu)
+	  (elt (cpu-dstack cpu) (cpu-dsp cpu)) 
+	  (cpu-dsp cpu) 
+	  (cpu-rsp cpu) ) 
+  (format t " ~S" (decode (elt (cpu-mem cpu) (cpu-pc cpu)))))
 
-(defun steps (thismany)
-  (dotimes (i thismany) (step1))
+(defun steps (thismany cpu)
+  (dotimes (i thismany) (step1 cpu))
   (?))
 
-(defun j1-reset (&optional (addr 0))
-  (setf pc addr
-	dsp 0
-	rsp 0
-	tos 0) )
+
+
